@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">FocusLock</string>
-    <string name="a11y_desc">Blocks distracting apps and adult sites while your focus timer is running.</string>
+    <string name="app_name">Focus Lock</string>
+    <string name="a11y_desc">Blocks distracting apps and adult sites while your focus timer or schedule is running.</string>
 </resources>

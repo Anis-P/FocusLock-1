@@ -7,6 +7,12 @@ import android.view.accessibility.AccessibilityNodeInfo
 
 class BlockerService : AccessibilityService() {
     private var last = 0L
+    private var lastPause = 0L
+    private var fgPkg = ""
+    private var fgStart = 0L
+    private var fgBase = -1L
+    private var limits: Map<String, Int> = emptyMap()
+    private var limitsAt = 0L
 
     private val guardPkgs = setOf(
         "com.android.settings", "com.google.android.packageinstaller",
@@ -22,25 +28,59 @@ class BlockerService : AccessibilityService() {
     )
     private val bad = listOf(
         "porn", "xvideos", "xnxx", "xhamster", "redtube", "youporn", "xxx", "hentai", "onlyfans",
-        "brazzers", "nsfw", "sexvideo", "sex-video", "sexy-video", "camgirl", "erotic", "nude",
-        "spankbang", "stripchat", "chaturbate", "bhabhi", "desisex", "hotsex", "adultvideo"
+        "brazzers", "nsfw", "sexvideo", "sex-video", "camgirl", "erotic", "nude", "spankbang",
+        "stripchat", "chaturbate", "bhabhi", "desisex", "hotsex", "adultvideo"
     )
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
-        if (e == null || !Store.locked(this)) return
+        if (e == null) return
         val pkg = e.packageName?.toString() ?: return
         if (pkg == packageName) return
+        val now = System.currentTimeMillis()
+        val stateChange = e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
 
-        val hit = ITEMS.firstOrNull { pkg in it.pkgs }
-        if (hit != null && hit.name in Store.apps(this)) {
-            if (hit.name == "YouTube Shorts") {
-                if (inShorts()) { throttled { performGlobalAction(GLOBAL_ACTION_BACK) } }
-            } else kick()
-            return
+        if (stateChange && pkg != fgPkg && !ignored(pkg)) {
+            fgPkg = pkg; fgStart = now; fgBase = -1L
         }
-        if (pkg in guardPkgs && allText(rootInActiveWindow).contains("focuslock")) { kick(); return }
-        if (Store.adult(this) && pkg in browsers && adultUrl(pkg)) kick()
+
+        val a = Blocking.current(this)
+        if (a != null) {
+            if (pkg in guardPkgs && allText(rootInActiveWindow).let { it.contains("focuslock") || it.contains("focus lock") }) {
+                block(null, "Focus Lock settings are locked while focus is on.", a.until); return
+            }
+            if (pkg in a.apps) {
+                block(pkg, "Blocked until ${clock(a.until)} (${a.label}).", a.until); return
+            }
+            if (SHORTS in a.apps && pkg == YT && inShorts()) {
+                throttled { performGlobalAction(GLOBAL_ACTION_BACK) }; return
+            }
+            if (a.adult && browsers.containsKey(pkg) && adultUrl(pkg)) {
+                block(null, "Adult content is blocked until ${clock(a.until)}.", a.until); return
+            }
+        }
+
+        // daily limits
+        if (now - limitsAt > 20_000) { limits = Store.limits(this); limitsAt = now }
+        val lim = limits[pkg]
+        if (lim != null && pkg == fgPkg) {
+            if (fgBase < 0) fgBase = Usage.today(this, pkg)
+            if (fgBase + (now - fgStart) >= lim * 60_000L) {
+                block(pkg, "You hit your daily limit of $lim min. Back tomorrow.", 0L); return
+            }
+        }
+
+        // mindful pause
+        if (stateChange && now - lastPause > 1500 && pkg in Store.pauseApps(this) && Store.grace(this, pkg) < now) {
+            lastPause = now
+            startActivity(
+                Intent(this, PauseActivity::class.java).putExtra("pkg", pkg)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            )
+        }
     }
+
+    private fun ignored(pkg: String) =
+        pkg == "com.android.systemui" || pkg.contains("inputmethod") || pkg.contains("keyboard")
 
     private fun inShorts(): Boolean {
         val r = rootInActiveWindow ?: return false
@@ -50,10 +90,10 @@ class BlockerService : AccessibilityService() {
 
     private fun adultUrl(pkg: String): Boolean {
         val r = rootInActiveWindow ?: return false
-        val nodes = r.findAccessibilityNodeInfosByViewId(browsers[pkg]!!)
-        return nodes.any { n ->
+        val words = bad + Store.keywords(this)
+        return r.findAccessibilityNodeInfosByViewId(browsers[pkg]!!).any { n ->
             val t = n.text?.toString()?.lowercase() ?: ""
-            bad.any { t.contains(it) }
+            words.any { t.contains(it) }
         }
     }
 
@@ -78,10 +118,14 @@ class BlockerService : AccessibilityService() {
         last = n; f()
     }
 
-    private fun kick() = throttled {
+    private fun block(pkg: String?, reason: String, until: Long) = throttled {
         performGlobalAction(GLOBAL_ACTION_HOME)
-        startActivity(Intent(this, MainActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        startActivity(
+            Intent(this, BlockActivity::class.java)
+                .putExtra("name", if (pkg == null) "" else Usage.label(this, pkg))
+                .putExtra("reason", reason).putExtra("until", until)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        )
     }
 
     override fun onInterrupt() {}
